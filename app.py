@@ -1,208 +1,262 @@
 
-import streamlit as st
-import cv2
-import tempfile
 import os
+import tempfile
 import time
+
+import cv2
+import numpy as np
+import streamlit as st
 from ultralytics import YOLO
 
+
+# -------------------- PAGE SETTINGS --------------------
+
 st.set_page_config(
-    page_title="Vehicle Detection and Speed Estimation",
-    page_icon="🚗",
+    page_title="YOLO Vision - Object Detection",
+    page_icon="🎯",
     layout="wide"
 )
 
-st.title("🚗 Vehicle Detection and Speed Estimation")
-st.write("YOLO-powered vehicle detection and approximate speed estimation.")
+st.title("🎯 YOLO Vision")
+st.subheader("Advanced Object Detection Suite")
+st.write(
+    "Upload a video, choose a YOLO model and object classes, "
+    "then download your video with detected objects."
+)
+
+
+# -------------------- MODEL LOADING --------------------
 
 @st.cache_resource
-def load_model():
-    return YOLO("yolov8n.pt")
+def load_model(model_name):
+    return YOLO(model_name)
+
+
+# -------------------- MODEL SELECTION --------------------
+
+st.sidebar.header("⚙️ Detection Settings")
+
+model_size = st.sidebar.selectbox(
+    "Select YOLO Model Size",
+    ["Nano (n)", "Small (s)", "Medium (m)", "Large (l)", "Extra Large (x)"]
+)
+
+size_map = {
+    "Nano (n)": "n",
+    "Small (s)": "s",
+    "Medium (m)": "m",
+    "Large (l)": "l",
+    "Extra Large (x)": "x"
+}
+
+model_name = f"yolov8{size_map[model_size]}.pt"
+
+confidence = st.sidebar.slider(
+    "Detection Confidence",
+    min_value=0.10,
+    max_value=0.95,
+    value=0.40,
+    step=0.05
+)
+
+st.sidebar.info(
+    f"Selected model: {model_name}\n\n"
+    "Larger models may be slower and require more memory."
+)
+
+
+# -------------------- VIDEO UPLOAD --------------------
 
 uploaded_video = st.file_uploader(
-    "Upload a road traffic video",
+    "📁 Upload a video",
     type=["mp4", "avi", "mov", "mkv"]
 )
 
-st.info(
-    "For approximate speed estimation, enter the number of pixels "
-    "per meter measured in your video. Accurate results require "
-    "camera calibration."
-)
-
-pixels_per_meter = st.number_input(
-    "Pixels per meter",
-    min_value=1.0,
-    max_value=10000.0,
-    value=20.0,
-    step=1.0
-)
-
 if uploaded_video is not None:
-    if st.button("▶ Start Vehicle Detection", type="primary"):
+
+    st.video(uploaded_video)
+
+    if st.button("🔍 Load Model and Detect Objects", type="primary"):
+
         input_path = None
         output_path = None
+        cap = None
 
         try:
-            with tempfile.NamedTemporaryFile(
-                delete=False, suffix=".mp4"
-            ) as temp_input:
-                temp_input.write(uploaded_video.getbuffer())
-                input_path = temp_input.name
+            # Save uploaded video temporarily
+            suffix = os.path.splitext(uploaded_video.name)[1] or ".mp4"
 
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=suffix
+            ) as input_file:
+                input_file.write(uploaded_video.getbuffer())
+                input_path = input_file.name
+
+            # Load selected model
+            with st.spinner(
+                f"Loading {model_name}. The first download may take a while..."
+            ):
+                model = load_model(model_name)
+
+            # Open video
             cap = cv2.VideoCapture(input_path)
 
             if not cap.isOpened():
-                st.error("Could not open this video.")
+                st.error(
+                    "Could not open this video. Try another MP4 or AVI file."
+                )
                 st.stop()
 
             fps = cap.get(cv2.CAP_PROP_FPS)
-            if not fps or fps <= 0:
-                fps = 25.0
-
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-            if total_frames <= 0 or width <= 0 or height <= 0:
-                cap.release()
-                st.error("The video has invalid dimensions or no frames.")
+            if fps <= 0 or width <= 0 or height <= 0:
+                st.error("The video has invalid dimensions or frame rate.")
                 st.stop()
 
+            # Prepare output video
             with tempfile.NamedTemporaryFile(
                 delete=False, suffix=".mp4"
-            ) as temp_output:
-                output_path = temp_output.name
+            ) as output_file:
+                output_path = output_file.name
 
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(
-                output_path,
-                cv2.VideoWriter_fourcc(*"mp4v"),
-                fps,
-                (width, height)
+                output_path, fourcc, fps, (width, height)
             )
 
             if not writer.isOpened():
-                cap.release()
                 st.error("Could not create the output video.")
                 st.stop()
 
-            model = load_model()
-            previous_positions = {}
-            speeds = {}
-            vehicle_ids = set()
+            # Get class names from the model
+            class_names = model.names
 
+            if isinstance(class_names, dict):
+                class_ids = sorted(class_names.keys())
+                class_labels = [
+                    f"{i}: {class_names[i]}" for i in class_ids
+                ]
+            else:
+                class_ids = list(range(len(class_names)))
+                class_labels = [
+                    f"{i}: {class_names[i]}" for i in class_ids
+                ]
+
+            selected_labels = st.multiselect(
+                "🎯 Select object classes to detect",
+                options=class_labels,
+                default=[
+                    label for label in class_labels
+                    if label.split(": ", 1)[-1] in [
+                        "person", "bicycle", "car",
+                        "motorcycle", "bus", "truck"
+                    ]
+                ],
+                help="Leave empty to detect all classes."
+            )
+
+            selected_ids = [
+                int(label.split(": ", 1)[0])
+                for label in selected_labels
+            ]
+
+            # Process video
             progress = st.progress(0)
             status = st.empty()
-            frame_number = 0
+
+            processed_frames = 0
+            detected_objects = 0
+            start_time = time.time()
 
             while True:
                 success, frame = cap.read()
+
                 if not success:
                     break
 
-                frame_number += 1
+                # Empty class selection means all classes
+                classes_to_use = selected_ids if selected_ids else None
 
-                results = model.track(
-                    frame,
-                    persist=True,
-                    tracker="bytetrack.yaml",
-                    classes=[2, 3, 5, 7],
-                    imgsz=640,
-                    conf=0.35,
+                results = model.predict(
+                    source=frame,
+                    conf=confidence,
+                    classes=classes_to_use,
                     verbose=False
                 )
 
-                result = results[0]
-                annotated = result.plot()
+                annotated_frame = results[0].plot()
+                writer.write(annotated_frame)
 
-                if result.boxes is not None and result.boxes.id is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    ids = result.boxes.id.int().cpu().tolist()
-                    labels = result.boxes.cls.int().cpu().tolist()
+                if results[0].boxes is not None:
+                    detected_objects += len(results[0].boxes)
 
-                    for box, track_id, class_id in zip(boxes, ids, labels):
-                        x1, y1, x2, y2 = box
-                        center_x = int((x1 + x2) / 2)
-                        center_y = int((y1 + y2) / 2)
-                        vehicle_ids.add(track_id)
+                processed_frames += 1
 
-                        if track_id in previous_positions:
-                            old_x, old_y, old_frame = previous_positions[track_id]
-                            elapsed = (frame_number - old_frame) / fps
+                if total_frames > 0:
+                    progress.progress(
+                        min(processed_frames / total_frames, 1.0)
+                    )
 
-                            if elapsed > 0:
-                                pixel_distance = (
-                                    (center_x - old_x) ** 2
-                                    + (center_y - old_y) ** 2
-                                ) ** 0.5
-
-                                speed_kmh = (
-                                    pixel_distance / pixels_per_meter
-                                ) / elapsed * 3.6
-
-                                # Ignore implausible jumps and smooth estimates.
-                                if speed_kmh <= 200:
-                                    old_speed = speeds.get(track_id, speed_kmh)
-                                    speeds[track_id] = (
-                                        0.7 * old_speed + 0.3 * speed_kmh
-                                    )
-
-                        previous_positions[track_id] = (
-                            center_x, center_y, frame_number
-                        )
-
-                        speed_text = (
-                            f"{speeds[track_id]:.1f} km/h"
-                            if track_id in speeds
-                            else "Calculating..."
-                        )
-
-                        cv2.putText(
-                            annotated,
-                            f"ID {track_id}: {speed_text}",
-                            (int(x1), max(25, int(y1) - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 0),
-                            2
-                        )
-
-                writer.write(annotated)
-                progress.progress(min(frame_number / total_frames, 1.0))
-                status.write(f"Processing frame {frame_number}/{total_frames}")
+                if processed_frames % 10 == 0:
+                    status.write(
+                        f"Processed {processed_frames} / "
+                        f"{total_frames if total_frames > 0 else '?'} frames"
+                    )
 
             cap.release()
+            cap = None
             writer.release()
 
-            st.success("Video processing completed!")
-            st.metric("Unique vehicle tracks detected", len(vehicle_ids))
+            elapsed = time.time() - start_time
 
-            with open(output_path, "rb") as video_file:
-                st.video(video_file.read())
+            progress.progress(1.0)
+            status.success("Video processing completed!")
 
-            with open(output_path, "rb") as video_file:
-                st.download_button(
-                    "⬇ Download Processed Video",
-                    data=video_file.read(),
-                    file_name="vehicle_detection_output.mp4",
-                    mime="video/mp4"
-                )
+            st.success("✅ Object detection completed successfully!")
 
-            st.warning(
-                "Speed values are estimates, not certified measurements. "
-                "They depend on camera calibration, perspective, tracking "
-                "quality, and the pixels-per-meter setting."
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric("Frames Processed", processed_frames)
+            col2.metric("Objects Detected", detected_objects)
+            col3.metric("Processing Time", f"{elapsed:.1f} sec")
+
+            # Display and download result
+            st.subheader("🎬 Processed Video")
+
+            with open(output_path, "rb") as result_file:
+                video_bytes = result_file.read()
+
+            st.video(video_bytes)
+
+            st.download_button(
+                label="⬇️ Download Annotated Video",
+                data=video_bytes,
+                file_name="yolo_detected_video.mp4",
+                mime="video/mp4"
             )
 
         except Exception as error:
-            st.error(f"Processing failed: {error}")
+            st.error(f"Something went wrong: {error}")
+            st.info(
+                "Try a smaller model, a shorter video, or a supported video format."
+            )
 
         finally:
-            for path in (input_path, output_path):
+            if cap is not None:
+                cap.release()
+
+            for path in [input_path, output_path]:
                 if path and os.path.exists(path):
                     try:
                         os.remove(path)
                     except OSError:
                         pass
+
 else:
-    st.caption("Upload a video to begin.")
+    st.info("👆 Upload a video above to begin object detection.")
+
+st.divider()
+st.caption("YOLO Vision | Powered by Ultralytics YOLO and OpenCV")
